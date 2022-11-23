@@ -31,9 +31,10 @@ is_unshare_alive() {
 }
 
 run_in_namespace() {
+  local nsdir=/proc/$(<$pidfile)/ns
   nsenter \
-    --pid=$rundir/ns/pid \
-    --mount=$rundir/ns/mount \
+    --pid=$nsdir/pid_for_children \
+    --mount=$nsdir/mnt \
     -- "$@"
 }
 
@@ -46,8 +47,8 @@ start_systemd() {
     -E LOCALE_ARCHIVE=/run/current-system/sw/lib/locale/locale-archive \
     "$(command -v unshare)" \
     --fork \
-    --pid=$rundir/ns/pid \
-    --mount=$rundir/ns/mount \
+    --pid \
+    --mount \
     --mount-proc=/proc \
     --propagation=unchanged \
     nixos-wsl-systemd-wrapper
