@@ -3,7 +3,7 @@ set -euo pipefail
 
 [ "${NIXOS_WSL_DEBUG:-}" == "1" ] && set -x
 
-rundir="/var/tmp/nixos-wsl"
+rundir="/run/nixos-wsl"
 pidfile="$rundir/unshare.pid"
 
 ensure_root() {
