@@ -2,6 +2,16 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
   throw "The tests are not compatible with Windows PowerShell, please use PowerShell Core instead"
 }
 
+function Remove-Escapes {
+  param(
+    [parameter(ValueFromPipeline = $true)]
+    [string[]]$InputObject
+  )
+  process {
+    $InputObject | ForEach-Object { $_ -replace '\x1b(\[(\?..|.)|.)', '' }
+  }
+}
+
 # Implementation-independent base class
 class Distro {
   [string]$id
@@ -75,7 +85,7 @@ class DockerDistro : Distro {
       [DockerDistro]::imageCreated = $true
     }
 
-    $this.id = [guid]::NewGuid().ToString()
+    $this.id = $(New-Guid).ToString()
 
     docker run -di --privileged --volume "/:$([DockerDistro]::hostMount)" --name $this.id $([DockerDistro]::imageName) "/bin/sh" | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -84,9 +94,10 @@ class DockerDistro : Distro {
   }
 
   [Array]Launch([string]$command) {
+    Write-Host "> $command"
     $result = @()
     docker exec -t $this.id /nix/nixos-wsl/entrypoint -c $command | Tee-Object -Variable result | Write-Host
-    return $result
+    return $result | Remove-Escapes
   }
 
   [string]GetPath([string]$path) {
@@ -115,7 +126,7 @@ class WslDistro : Distro {
   WslDistro() {
     $tarball = $this.FindTarball()
 
-    $this.id = [guid]::NewGuid().ToString()
+    $this.id = $(New-Guid).ToString()
     $this.tempdir = Join-Path $([System.IO.Path]::GetTempPath()) $this.id
     New-Item -ItemType Directory $this.tempdir
 
@@ -127,9 +138,10 @@ class WslDistro : Distro {
   }
 
   [Array]Launch([string]$command) {
+    Write-Host "> $command"
     $result = @()
-    & wsl.exe (@("-d", "$($this.id)") + $command.Split()) | Tee-Object -Variable result | Write-Host
-    return $result
+    & wsl.exe -d $this.id -e /nix/nixos-wsl/entrypoint -c $command | Tee-Object -Variable result | Write-Host
+    return $result | Remove-Escapes
   }
 
   [string]GetPath([string]$path) {
@@ -155,9 +167,11 @@ class WslDistro : Distro {
 # Auto-select the implementation to use
 function Install-Distro() {
   if ($IsWindows) {
+    Write-Host "Detected Windows host, using WSL2"
     return [WslDistro]::new()
   }
   else {
+    Write-Host "Detected Linux host, using Docker"
     return [DockerDistro]::new()
   }
 }

@@ -1,9 +1,27 @@
 { lib, pkgs, config, options, ... }:
 
-with lib; {
+with lib;
+
+let
+  bashWrapper = pkgs.runCommand "nixos-wsl-bash-wrapper"
+    {
+      nativeBuildInputs = [ pkgs.makeWrapper ];
+    } ''
+    makeWrapper ${pkgs.bashInteractive}/bin/sh $out/bin/sh \
+      --prefix PATH ':' ${lib.makeBinPath (with pkgs; [ systemd gnugrep ])}
+  '';
+
+  cfg = config.wsl;
+in
+{
 
   options.wsl = with types; {
     enable = mkEnableOption "support for running NixOS as a WSL distribution";
+    binShPkg = mkOption {
+      type = lib.types.package;
+      internal = true;
+      description = "Package to be linked to /bin/sh. Mainly useful to be re-used by other modules like envfs.";
+    };
     nativeSystemd = mkOption {
       type = bool;
       default = false;
@@ -14,43 +32,48 @@ with lib; {
       default = "nixos";
       description = "The name of the default user";
     };
+    populateBin = mkOption {
+      type = bool;
+      default = true;
+      internal = true;
+      description = ''
+        Dangerous! Things might break. Use with caution!
+
+        Do not populate /bin.
+
+        This is mainfly useful if another module populates /bin like envfs.
+      '';
+    };
     startMenuLaunchers = mkEnableOption "shortcuts for GUI applications in the windows start menu";
   };
 
   config =
     let
-      cfg = config.wsl;
-
       syschdemd = pkgs.callPackage ../scripts/syschdemd.nix {
         automountPath = cfg.wslConf.automount.root;
         defaultUser = config.users.users.${cfg.defaultUser};
       };
 
-      shim = pkgs.callPackage ../scripts/native-systemd-shim/shim.nix { };
-
-      bashWrapper = pkgs.runCommand "nixos-wsl-bash-wrapper" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-        makeWrapper ${pkgs.bashInteractive}/bin/sh $out/bin/sh --prefix PATH ':' ${lib.makeBinPath [pkgs.systemd pkgs.gnugrep]}
-      '';
-
-      bash = if cfg.nativeSystemd then bashWrapper else pkgs.bashInteractive;
+      nativeUtils = pkgs.callPackage ../scripts/native-utils { };
     in
     mkIf cfg.enable (
       mkMerge [
         {
-          # We don't need a boot loader
-          boot.loader.grub.enable = false;
+          # WSL uses its own kernel and boot loader
+          boot = {
+            initrd.enable = false;
+            kernel.enable = false;
+            loader.grub.enable = false;
+            modprobeConfig.enable = false;
+          };
           system.build.installBootLoader = "${pkgs.coreutils}/bin/true";
-          boot.initrd.enable = false;
-          system.build.initialRamdisk = pkgs.runCommand "fake-initrd" { } ''
-            mkdir $out
-            touch $out/${config.system.boot.loader.initrdFile}
-          '';
-          system.build.initialRamdiskSecretAppender = pkgs.writeShellScriptBin "append-initrd-secrets" "";
+
+          # WSL does not support virtual consoles
+          console.enable = false;
 
           hardware.opengl.enable = true; # Enable GPU acceleration
 
           environment = {
-
             # Only set the options if the files are managed by WSL
             etc = mkMerge [
               (mkIf config.wsl.wslConf.network.generateHosts {
@@ -60,15 +83,9 @@ with lib; {
                 "resolv.conf".enable = false;
               })
             ];
-
-            systemPackages = [
-              (pkgs.runCommand "wslpath" { } ''
-                mkdir -p $out/bin
-                ln -s /init $out/bin/wslpath
-              '')
-            ];
           };
 
+          # dhcp is handled by windows
           networking.dhcpcd.enable = false;
 
           users.users.${cfg.defaultUser} = {
@@ -98,36 +115,46 @@ with lib; {
                 done
               ''
             );
-            populateBin = stringAfter [ ] ''
+            populateBin = lib.mkIf cfg.populateBin (stringAfter [ ] ''
               echo "setting up /bin..."
               ln -sf /init /bin/wslpath
-              ln -sf ${bash}/bin/sh /bin/sh
+              ln -sf ${cfg.binShPkg}/bin/sh /bin/sh
               ln -sf ${pkgs.util-linux}/bin/mount /bin/mount
+            '');
+            update-entrypoint.text = ''
+              mkdir -p /nix/nixos-wsl
+              ln -sfn ${config.users.users.root.shell} /nix/nixos-wsl/entrypoint
             '';
           };
+
+          # no udev devices can be attached
+          services.udev.enable = lib.mkDefault false;
 
           systemd = {
             # Disable systemd units that don't make sense on WSL
             services = {
-              # no virtual console to switch to
-              "serial-getty@ttyS0".enable = false;
-              "serial-getty@hvc0".enable = false;
-              "getty@tty1".enable = false;
-              "autovt@".enable = false;
               firewall.enable = false;
-              systemd-resolved.enable = false;
+              systemd-resolved.enable = lib.mkDefault false;
               # system clock cannot be changed
               systemd-timesyncd.enable = false;
-              # no udev devices can be attached
-              systemd-udevd.enable = false;
             };
 
             # Don't allow emergency mode, because we don't have a console.
             enableEmergencyMode = false;
+
+            # Link the X11 socket into place. This is a no-op on a normal setup,
+            # but helps if /tmp is a tmpfs or mounted from some other location.
+            tmpfiles.rules = [ "L /tmp/.X11-unix - - - - ${cfg.wslConf.automount.root}/wslg/.X11-unix" ];
           };
 
           # Start a systemd user session when starting a command through runuser
           security.pam.services.runuser.startSession = true;
+
+          # require people to use lib.mkForce to make it harder to brick their installation
+          wsl = {
+            binShPkg = if cfg.nativeSystemd then bashWrapper else pkgs.bashInteractive;
+            populateBin = true;
+          };
 
           warnings = flatten [
             (optional (config.services.resolved.enable && config.wsl.wslConf.network.generateResolvConf)
@@ -153,7 +180,7 @@ with lib; {
         })
         (mkIf cfg.nativeSystemd {
           wsl.wslConf = {
-            user.default = cfg.defaultUser;
+            user.default = config.users.users.${cfg.defaultUser}.name;
             boot.systemd = true;
           };
 
@@ -161,23 +188,20 @@ with lib; {
             shimSystemd = stringAfter [ ] ''
               echo "setting up /sbin/init shim..."
               mkdir -p /sbin
-              ln -sf ${shim}/bin/nixos-wsl-native-systemd-shim /sbin/init
+              ln -sf ${nativeUtils}/bin/systemd-shim /sbin/init
             '';
-            setupLogin = stringAfter [ ] ''
+            setupLogin = lib.mkIf cfg.populateBin (stringAfter [ ] ''
               echo "setting up /bin/login..."
               mkdir -p /bin
               ln -sf ${pkgs.shadow}/bin/login /bin/login
-            '';
+            '');
           };
 
           environment = {
             # preserve $PATH from parent
             variables.PATH = [ "$PATH" ];
             extraInit = ''
-              export WSLPATH=$(echo "$PATH" | tr ':' '\n' | grep -E "^${cfg.wslConf.automount.root}" | tr '\n' ':')
-              ${if cfg.interop.includePath then "" else ''
-                export PATH=$(echo "$PATH" | tr ':' '\n' | grep -vE "^${cfg.wslConf.automount.root}" | tr '\n' ':')
-              ''}
+              eval $(${nativeUtils}/bin/split-path --automount-root="${cfg.wslConf.automount.root}" ${lib.optionalString cfg.interop.includePath "--include-interop"})
             '';
           };
         })
